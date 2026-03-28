@@ -16,13 +16,10 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
+from service_results_adapter import convert_dart_world_joints_to_raw_positions, write_mdm_style_results
+
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from vrcai.dart_conversion import convert_dart_world_joints_to_raw_positions, write_mdm_style_results
 
 
 SERVICE_NAME = "dart_session_service_v1"
@@ -32,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent DART prompt generation service.")
     parser.add_argument("--host", default="127.0.0.1", help="Service bind host.")
     parser.add_argument("--port", type=int, default=8765, help="Service TCP port.")
-    parser.add_argument("--dart-dir", default=str(ROOT / "dart"), help="Path to the DART checkout.")
+    parser.add_argument("--dart-dir", default=str(ROOT), help="Path to the DART checkout.")
     parser.add_argument("--denoiser-checkpoint", required=True, help="Path to the DART denoiser checkpoint.")
     parser.add_argument("--dataset", default="babel", help="DART rollout dataset name.")
     parser.add_argument("--device", default="cuda", help="Torch device to use.")
