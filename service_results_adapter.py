@@ -42,7 +42,9 @@ _DART_TO_VRCAI_JOINT_ORDER = (
     20,  # LeftHand <- left_wrist
 )
 
-_DART_FOOT_JOINTS = (10, 11)
+# Use both ankle and foot joints for floor normalization so imported ankle trackers
+# line up with the same standing height as the previous MDM/MMotion pipeline.
+_DART_SUPPORT_JOINTS = (7, 8, 10, 11)
 _DART_TO_HML3D_AXIS = np.array(
     [
         [-1.0, 0.0, 0.0],
@@ -72,7 +74,7 @@ def convert_dart_world_joints_to_processed_positions(dart_joints: np.ndarray) ->
         raise ValueError("DART joint sequences must contain at least one frame.")
 
     normalized = joints.copy()
-    floor_height = float(normalized[0, _DART_FOOT_JOINTS, 2].min())
+    floor_height = float(normalized[0, _DART_SUPPORT_JOINTS, 2].min())
     normalized[:, :, 2] -= floor_height
     normalized = np.matmul(normalized, _DART_TO_HML3D_AXIS).astype(np.float32)
     return reorder_dart_joints_to_vrcai(normalized)
