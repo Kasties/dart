@@ -77,7 +77,11 @@ def convert_dart_world_joints_to_processed_positions(dart_joints: np.ndarray) ->
     floor_height = float(normalized[0, _DART_SUPPORT_JOINTS, 2].min())
     normalized[:, :, 2] -= floor_height
     normalized = np.matmul(normalized, _DART_TO_HML3D_AXIS).astype(np.float32)
-    return reorder_dart_joints_to_vrcai(normalized)
+    processed = reorder_dart_joints_to_vrcai(normalized)
+    # DART world joints are floor-relative, while the downstream package format
+    # expects the same standing-height offset used by the legacy MDM/MMotion flow.
+    processed[..., 1] += float(DEFAULT_Y_OFFSET)
+    return processed.astype(np.float32)
 
 
 def convert_dart_world_joints_to_raw_positions(
