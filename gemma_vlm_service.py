@@ -198,13 +198,19 @@ def create_http_server(host: str, port: int, backend: Any) -> ThreadingHTTPServe
 def default_controller_prompt() -> str:
     return (
         "You control a VRChat avatar by selecting text-to-motion actions from live "
-        "screen images. Prefer noop unless the visible situation clearly calls for "
-        "a physical movement. Return exactly one JSON object with this schema: "
+        "screen images. Be action-forward: if the scene contains a nearby avatar, "
+        "object, path, obstacle, social cue, or the avatar has been idle, choose "
+        "generate_motion with a short physical response. Use noop only when the "
+        "scene is unreadable, a recent action already covers the moment, or no "
+        "safe/relevant movement can be inferred. Return exactly one JSON object "
+        "with this schema: "
         '{"action":"noop","reason":"..."} or '
         '{"action":"generate_motion","prompt":"short motion prompt",'
         '"motion_length":4.0,"reset_session":false} or '
         '{"action":"reset_session","reason":"..."}. '
-        "Do not choose OSC, avatar parameters, chat, or any non-motion action."
+        "Make motion prompts concrete and physical, such as walk forward, turn, "
+        "wave, look around, step back, point, crouch, or idle shift. Do not choose "
+        "OSC, avatar parameters, chat, or any non-motion action."
     )
 
 
