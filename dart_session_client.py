@@ -16,6 +16,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-id", default="", help="Optional caller job id.")
     parser.add_argument("--seed", type=int, help="Optional random seed.")
     parser.add_argument("--reset-session", action="store_true", help="Reset the remote DART session before generating.")
+    parser.add_argument(
+        "--goal-location",
+        help="Optional absolute reach target formatted as x,y,z in DART world meters.",
+    )
     parser.add_argument("--timeout-sec", type=float, default=900.0, help="Socket timeout in seconds.")
     return parser.parse_args()
 
@@ -33,12 +37,24 @@ def main() -> int:
     }
     if args.seed is not None:
         request["seed"] = int(args.seed)
+    if args.goal_location:
+        request["goal_location"] = parse_goal_location(args.goal_location)
 
     response = send_request(args.host, args.port, request, timeout_sec=args.timeout_sec)
     print(json.dumps(response, ensure_ascii=True))
     if not response.get("ok", False):
         return 1
     return 0
+
+
+def parse_goal_location(value: str) -> list[float]:
+    parts = [part for part in str(value).replace(",", " ").split() if part]
+    if len(parts) != 3:
+        raise ValueError("--goal-location must contain exactly three numbers formatted like 0,4,0.")
+    try:
+        return [float(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError as exc:
+        raise ValueError("--goal-location values must be numeric.") from exc
 
 
 def send_request(host: str, port: int, request: Dict[str, Any], timeout_sec: float) -> Dict[str, Any]:

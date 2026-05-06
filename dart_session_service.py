@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import math
 import os
@@ -13,7 +14,7 @@ import threading
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 import torch
@@ -25,6 +26,10 @@ ROOT = Path(__file__).resolve().parent
 
 
 SERVICE_NAME = "dart_session_service_v1"
+DEFAULT_GOAL_POLICY_CHECKPOINT = (
+    "policy_train/reach_location_mld/fixtext_repeat_floor100_hop10_skate100/iter_2000.pth"
+)
+DEFAULT_GOAL_INIT_DATA_PATH = "data/stand.pkl"
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +46,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-noise", type=int, default=0, help="Use zero init noise for sampling.")
     parser.add_argument("--show-viewer", action="store_true", help="Visualize the latest generated segment on the generator machine.")
     parser.add_argument("--max-frame-count", type=int, default=196, help="Maximum allowed frame count.")
+    parser.add_argument(
+        "--goal-policy-checkpoint",
+        default=DEFAULT_GOAL_POLICY_CHECKPOINT,
+        help="Reach-location policy checkpoint used when requests include goal_location.",
+    )
+    parser.add_argument(
+        "--goal-init-data-path",
+        default=DEFAULT_GOAL_INIT_DATA_PATH,
+        help="Initial motion seed for reach-location policy requests.",
+    )
+    parser.add_argument("--goal-num-envs", type=int, default=1, help="Parallel reach-location policy rollouts.")
+    parser.add_argument("--goal-num-steps", type=int, default=256, help="Maximum reach-location policy steps.")
+    parser.add_argument("--goal-obs-angle-clip", type=float, default=60.0, help="Reach policy goal angle observation clip.")
+    parser.add_argument("--goal-obs-dist-clip", type=float, default=5.0, help="Reach policy goal distance observation clip.")
     return parser.parse_args()
 
 
@@ -148,6 +167,7 @@ class DartSessionGenerator:
         self.history_length = int(self.dataset.history_length)
         self.batch_size = int(args.batch_size)
         self.viewer = ViewerController(sys.executable, self.dart_dir) if args.show_viewer else None
+        self._goal_controller: Optional["DartGoalReachController"] = None
 
         batch = self.dataset.get_batch(batch_size=self.batch_size)
         seed_batch = batch[0]
@@ -178,6 +198,50 @@ class DartSessionGenerator:
         self.history_motion = self.initial_history_motion.clone()
         self.transf_rotmat = self.initial_transf_rotmat.clone()
         self.transf_transl = self.initial_transf_transl.clone()
+
+    def current_history_state(self) -> Dict[str, Any]:
+        history_frames = self.dataset.denormalize(self.history_motion)
+        history_feature_dict = self.primitive_utility.tensor_to_dict(history_frames)
+        history_feature_dict.update(
+            {
+                "transf_rotmat": self.transf_rotmat,
+                "transf_transl": self.transf_transl,
+                "gender": self.gender,
+                "betas": self.betas[:, : self.history_length, :],
+                "pelvis_delta": self.pelvis_delta,
+            }
+        )
+        return history_feature_dict
+
+    def generate_goal_motion(
+        self,
+        prompt: str,
+        frame_count: int,
+        guidance_param: float,
+        output_dir: Path,
+        goal_location: Sequence[float],
+        seed: Optional[int] = None,
+        reset_session: bool = False,
+    ) -> Dict[str, Any]:
+        if reset_session:
+            self.reset()
+        if self._goal_controller is None:
+            self._goal_controller = DartGoalReachController(self)
+
+        result = self._goal_controller.generate_motion(
+            prompt=prompt,
+            frame_count=frame_count,
+            guidance_param=guidance_param,
+            output_dir=output_dir,
+            goal_location=goal_location,
+            seed=seed,
+        )
+        if self._goal_controller.last_state_human is not None:
+            state_human = self._goal_controller.last_state_human
+            self.transf_rotmat = state_human["transf_rotmat"].detach().clone()
+            self.transf_transl = state_human["transf_transl"].detach().clone()
+            self.history_motion = self.dataset.normalize(self.primitive_utility.dict_to_tensor(state_human))
+        return result
 
     def generate_motion(
         self,
@@ -329,6 +393,227 @@ class DartSessionGenerator:
         return seq_path
 
 
+class DartGoalReachController:
+    def __init__(self, parent: DartSessionGenerator) -> None:
+        self.parent = parent
+        self.service_args = parent.args
+        self.device = parent.device
+        self.last_state_human: Optional[Dict[str, Any]] = None
+
+        checkpoint = _resolve_dart_path(parent.dart_dir, str(self.service_args.goal_policy_checkpoint))
+        if not checkpoint.exists():
+            raise FileNotFoundError(
+                "DART goal-location requests require a reach-location policy checkpoint. "
+                "Expected: {path}. Start the service with --goal-policy-checkpoint if it lives elsewhere."
+                .format(path=checkpoint)
+            )
+        init_data_path = _resolve_dart_path(parent.dart_dir, str(self.service_args.goal_init_data_path))
+        if not init_data_path.exists():
+            raise FileNotFoundError(
+                "DART goal-location requests require an init seed file. Expected: {path}."
+                .format(path=init_data_path)
+            )
+        arg_path = checkpoint.parent / "args.yaml"
+        if not arg_path.exists():
+            raise FileNotFoundError("Could not find reach-location args.yaml next to {path}.".format(path=checkpoint))
+
+        import tyro
+        import yaml
+        from control.env.env_reach_location_mld import EnvReachLocationMLD
+        from control.policy.policy import PolicyReachLocationMLP, PolicyReachLocationTransformer
+        from control.train_reach_location_mld import ReachLocationArgs
+        from mld.train_mld import create_gaussian_diffusion
+
+        with arg_path.open("r", encoding="utf-8") as handle:
+            reach_args = tyro.extras.from_yaml(ReachLocationArgs, yaml.safe_load(handle))
+
+        num_steps = max(1, int(self.service_args.goal_num_steps))
+        reach_args.env_id = reach_args.env_args.env_id
+        reach_args.num_envs = reach_args.env_args.num_envs = max(1, int(self.service_args.goal_num_envs))
+        # Keep the env from truncating and resetting on the final requested policy step.
+        reach_args.num_steps = reach_args.env_args.num_steps = num_steps + 1
+        reach_args.env_args.export_interval = 1
+        reach_args.env_args.enable_export = 1
+        reach_args.env_args.obs_goal_angle_clip = float(self.service_args.goal_obs_angle_clip)
+        reach_args.env_args.obs_goal_dist_clip = float(self.service_args.goal_obs_dist_clip)
+        reach_args.init_data_path = str(init_data_path)
+        reach_args.device = self.device
+        reach_args.save_dir = checkpoint.parent
+
+        diffusion_args = deepcopy(parent.denoiser_args.diffusion_args)
+        diffusion_args.respacing = reach_args.respacing
+        diffusion = create_gaussian_diffusion(diffusion_args)
+        env = EnvReachLocationMLD(
+            reach_args,
+            parent.denoiser_args,
+            parent.denoiser_model,
+            parent.vae_args,
+            parent.vae_model,
+            diffusion,
+            parent.dataset,
+        )
+
+        policy_args = reach_args.policy_args
+        policy_args.observation_structure = env.observation_structure
+        policy_args.action_structure = env.action_structure
+        if policy_args.architecture == "mlp":
+            agent = PolicyReachLocationMLP(policy_args).to(self.device)
+        else:
+            agent = PolicyReachLocationTransformer(policy_args).to(self.device)
+        agent.load_state_dict(torch.load(str(checkpoint), map_location=self.device))
+        agent.eval()
+
+        self.args = reach_args
+        self.env = env
+        self.agent = agent
+        self.max_policy_steps = num_steps
+        self.checkpoint = checkpoint
+
+    def generate_motion(
+        self,
+        prompt: str,
+        frame_count: int,
+        guidance_param: float,
+        output_dir: Path,
+        goal_location: Sequence[float],
+        seed: Optional[int],
+    ) -> Dict[str, Any]:
+        goal = _normalize_goal_location(goal_location)
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed % (2**32 - 1))
+            torch.manual_seed(seed)
+
+        self.args.guidance_param = float(guidance_param)
+        self.env.input_args.guidance_param = float(guidance_param)
+        self.env.args.save_dir = Path(output_dir) / "goal_policy_export"
+        self.env.args.save_dir.mkdir(parents=True, exist_ok=True)
+        self.env.max_steps = self.max_policy_steps + 1
+        self.env.args.num_steps = self.max_policy_steps + 1
+
+        goal_tensor = torch.tensor(goal, dtype=torch.float32, device=self.device).reshape(1, 3)
+        goal_tensor = goal_tensor.repeat(self.env.batch_size, 1)
+        goal_texts = np.array([prompt] * self.env.batch_size)
+        next_obs, _ = self.env.reset(goal_location=goal_tensor, goal_texts=goal_texts)
+        self.env.state_human = _repeat_state(self.parent.current_history_state(), self.env.batch_size)
+        next_obs = self.env.get_observation()
+
+        selected_idx = 0
+        reached_goal = False
+        best_distance = math.inf
+        for _ in range(self.max_policy_steps):
+            with torch.no_grad():
+                action, _, _, _ = self.agent.get_action_and_value(next_obs)
+            next_obs, _, success, _, _, _ = self.env.step(
+                action,
+                next_goal_location=goal_tensor,
+                next_goal_texts=goal_texts,
+                reset_text=True,
+            )
+            distances = torch.norm((goal_tensor - self.env.get_global_pelvis())[:, :2], dim=-1)
+            min_distance, min_idx = distances.min(dim=0)
+            if float(min_distance.item()) < best_distance:
+                best_distance = float(min_distance.item())
+                selected_idx = int(min_idx.item())
+            if success.any():
+                selected_idx = int(torch.nonzero(success, as_tuple=True)[0][0].item())
+                reached_goal = True
+                best_distance = float(distances[selected_idx].item())
+                break
+
+        sequence = self.env.sequences[selected_idx]
+        world_joints_tensor = sequence["joints"]
+        if world_joints_tensor.shape[0] > self.parent.history_length:
+            world_joints_tensor = world_joints_tensor[self.parent.history_length :]
+        world_joints = world_joints_tensor.detach().cpu().numpy()
+        if world_joints.shape[0] == 0:
+            raise RuntimeError("Reach-location policy produced no motion frames.")
+        if frame_count > 0 and world_joints.shape[0] > int(frame_count):
+            world_joints = world_joints[: int(frame_count)]
+
+        raw_positions = convert_dart_world_joints_to_raw_positions(world_joints)
+        write_mdm_style_results(
+            output_dir,
+            raw_positions,
+            prompt=prompt,
+            generator=SERVICE_NAME + "_goal_reach",
+        )
+
+        viewer_sample_path = self._write_goal_viewer_sample(Path(output_dir), sequence, selected_idx)
+        if self.parent.viewer is not None:
+            self.parent.viewer.show(viewer_sample_path)
+
+        self.last_state_human = _state_subset(self.env.state_human, selected_idx)
+        return {
+            "frame_count": int(raw_positions.shape[0]),
+            "joint_count": int(raw_positions.shape[1]),
+            "viewer_sample": str(viewer_sample_path),
+            "goal_location": list(goal),
+            "goal_reached": bool(reached_goal),
+            "goal_distance": float(best_distance),
+            "goal_policy_checkpoint": str(self.checkpoint),
+        }
+
+    def _write_goal_viewer_sample(self, output_dir: Path, sequence: Dict[str, Any], selected_idx: int) -> Path:
+        seq_path = output_dir / "sample_0.pkl"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        export_sequence = dict(sequence)
+        export_sequence["texts"] = sequence.get("goal_texts_list", [])
+        export_sequence["text_idx"] = sequence.get("goal_texts_idx", [])
+        export_sequence["history_length"] = self.parent.history_length
+        export_sequence["future_length"] = self.parent.future_length
+        export_sequence["selected_env"] = int(selected_idx)
+        with seq_path.open("wb") as handle:
+            pickle.dump(export_sequence, handle)
+        return seq_path
+
+
+def _resolve_dart_path(dart_dir: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = dart_dir / path
+    return path.resolve()
+
+
+def _normalize_goal_location(goal_location: Sequence[float]) -> tuple[float, float, float]:
+    if isinstance(goal_location, str):
+        values = [part for part in goal_location.replace(",", " ").split() if part]
+    else:
+        values = list(goal_location)
+    if len(values) != 3:
+        raise ValueError("goal_location must contain exactly three numbers: x, y, z.")
+    try:
+        return (float(values[0]), float(values[1]), float(values[2]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("goal_location values must be numeric.") from exc
+
+
+def _state_subset(state: Dict[str, Any], index: int) -> Dict[str, Any]:
+    subset: Dict[str, Any] = {}
+    for key, value in state.items():
+        if torch.is_tensor(value):
+            subset[key] = value[index : index + 1].detach().clone()
+        else:
+            subset[key] = value
+    return subset
+
+
+def _repeat_state(state: Dict[str, Any], batch_size: int) -> Dict[str, Any]:
+    repeated: Dict[str, Any] = {}
+    for key, value in state.items():
+        if torch.is_tensor(value):
+            if value.shape[0] == batch_size:
+                repeated[key] = value.detach().clone()
+            elif value.shape[0] == 1:
+                repeats = [batch_size] + [1] * (value.ndim - 1)
+                repeated[key] = value.repeat(*repeats).detach().clone()
+            else:
+                repeated[key] = value[:batch_size].detach().clone()
+        else:
+            repeated[key] = value
+    return repeated
+
+
 class PromptRequestHandler(socketserver.StreamRequestHandler):
     state: ServiceState
     max_frame_count: int
@@ -374,18 +659,31 @@ class PromptRequestHandler(socketserver.StreamRequestHandler):
         seed_value = request.get("seed")
         seed = int(seed_value) if seed_value is not None else None
         reset_session = bool(request.get("reset_session", False))
+        goal_value = request.get("goal_location")
+        goal_location = _normalize_goal_location(goal_value) if goal_value is not None else None
 
         with self.state.lock:
-            result = self.state.generator.generate_motion(
-                prompt=prompt,
-                frame_count=frame_count,
-                guidance_param=guidance_param,
-                output_dir=Path(output_dir),
-                seed=seed,
-                reset_session=reset_session,
-            )
+            if goal_location is not None:
+                result = self.state.generator.generate_goal_motion(
+                    prompt=prompt,
+                    frame_count=frame_count,
+                    guidance_param=guidance_param,
+                    output_dir=Path(output_dir),
+                    goal_location=goal_location,
+                    seed=seed,
+                    reset_session=reset_session,
+                )
+            else:
+                result = self.state.generator.generate_motion(
+                    prompt=prompt,
+                    frame_count=frame_count,
+                    guidance_param=guidance_param,
+                    output_dir=Path(output_dir),
+                    seed=seed,
+                    reset_session=reset_session,
+                )
 
-        return {
+        response = {
             "ok": True,
             "task": task,
             "output_dir": output_dir,
@@ -397,6 +695,16 @@ class PromptRequestHandler(socketserver.StreamRequestHandler):
             "service": SERVICE_NAME,
             "viewer_sample": result["viewer_sample"],
         }
+        if goal_location is not None:
+            response.update(
+                {
+                    "goal_location": result.get("goal_location", list(goal_location)),
+                    "goal_reached": bool(result.get("goal_reached", False)),
+                    "goal_distance": float(result.get("goal_distance", math.inf)),
+                    "goal_policy_checkpoint": str(result.get("goal_policy_checkpoint", "")),
+                }
+            )
+        return response
 
 
 def _build_handler(state: ServiceState, max_frame_count: int):
