@@ -47,7 +47,7 @@ _DART_TO_VRCAI_JOINT_ORDER = (
 _DART_SUPPORT_JOINTS = (7, 8, 10, 11)
 _DART_TO_HML3D_AXIS = np.array(
     [
-        [-1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0],
         [0.0, 1.0, 0.0],
     ],

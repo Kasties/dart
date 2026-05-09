@@ -6,6 +6,7 @@ usage() {
 Usage: ./start_vrcai_services.sh [start|stop|restart|start-vlm|stop-vlm|restart-vlm|start-gemma|stop-gemma|restart-gemma|status|logs|check-env]
 
 Environment overrides:
+  VRCAI_SERVICES_ENV      Optional env file to source. Default: $DART_DIR/vrcai_services.local.env.
   CONDA_ENV               Conda env to activate before starting Python services. Default: DART.
   CONDA_SH                Optional path to conda.sh if Conda is not on PATH.
   PYTHON_BIN              Explicit Python override. Default: python from the activated Conda env.
@@ -22,9 +23,16 @@ Environment overrides:
   GOAL_NUM_STEPS          Maximum reach-location policy steps. Default: 256.
   LLAMA_SERVER_BIN        llama.cpp server binary. Default: llama-server.
   VLM_MODEL_ID            llama.cpp HF GGUF repo/model id. Default: ggml-org/gemma-4-E4B-it-GGUF.
+  LLAMA_MODEL_PATH        Local GGUF model path. Overrides VLM_MODEL_ID.
+  LLAMA_MODEL_URL         Direct GGUF model URL. Overrides VLM_MODEL_ID.
+  LLAMA_HF_FILE           Explicit Hugging Face GGUF file for older llama.cpp builds.
+  LLAMA_MMPROJ_PATH       Local multimodal projector path.
+  LLAMA_MMPROJ_URL        Direct multimodal projector URL.
   LLAMA_HOST              llama-server bind host. Default: 127.0.0.1.
   LLAMA_PORT              llama-server port. Default: 8778.
   LLAMA_CTX_SIZE          llama-server context size. Default: 8192.
+  LLAMA_REASONING         llama-server reasoning mode. Default: off.
+  LLAMA_REASONING_BUDGET  Optional llama-server reasoning token budget.
   LLAMA_EXTRA_ARGS        Extra llama-server args, split by shell words.
   VLM_HOST                VLM adapter bind host. Default: 0.0.0.0.
   VLM_PORT                VLM adapter port. Default: 8777.
@@ -41,6 +49,15 @@ EOF
 ACTION="${1:-start}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DART_DIR="${DART_DIR:-$SCRIPT_DIR}"
+
+LOCAL_ENV_FILE="${VRCAI_SERVICES_ENV:-$DART_DIR/vrcai_services.local.env}"
+if [[ -f "$LOCAL_ENV_FILE" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$LOCAL_ENV_FILE"
+  set +a
+fi
+
 CONDA_ENV="${CONDA_ENV:-DART}"
 
 DENOISER_CHECKPOINT="${DENOISER_CHECKPOINT:-$DART_DIR/mld_denoiser/mld_fps_clip_repeat_euler/checkpoint_300000.pt}"
@@ -54,11 +71,26 @@ GOAL_INIT_DATA_PATH="${GOAL_INIT_DATA_PATH:-$DART_DIR/data/stand.pkl}"
 GOAL_NUM_ENVS="${GOAL_NUM_ENVS:-1}"
 GOAL_NUM_STEPS="${GOAL_NUM_STEPS:-256}"
 
-LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-llama-server}"
+if [[ -z "${LLAMA_SERVER_BIN:-}" ]]; then
+  if command -v llama-server >/dev/null 2>&1; then
+    LLAMA_SERVER_BIN="$(command -v llama-server)"
+  elif [[ -x /mnt/ssd/llama.cpp/build/bin/llama-server ]]; then
+    LLAMA_SERVER_BIN="/mnt/ssd/llama.cpp/build/bin/llama-server"
+  else
+    LLAMA_SERVER_BIN="llama-server"
+  fi
+fi
 VLM_MODEL_ID="${VLM_MODEL_ID:-${GEMMA_MODEL_ID:-ggml-org/gemma-4-E4B-it-GGUF}}"
+LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-}"
+LLAMA_MODEL_URL="${LLAMA_MODEL_URL:-}"
+LLAMA_HF_FILE="${LLAMA_HF_FILE:-}"
+LLAMA_MMPROJ_PATH="${LLAMA_MMPROJ_PATH:-}"
+LLAMA_MMPROJ_URL="${LLAMA_MMPROJ_URL:-}"
 LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 LLAMA_PORT="${LLAMA_PORT:-8778}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-8192}"
+LLAMA_REASONING="${LLAMA_REASONING:-off}"
+LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-}"
 LLAMA_URL="${LLAMA_URL:-http://127.0.0.1:${LLAMA_PORT}}"
 VLM_HOST="${VLM_HOST:-${GEMMA_HOST:-0.0.0.0}}"
 VLM_PORT="${VLM_PORT:-${GEMMA_PORT:-8777}}"
@@ -233,12 +265,31 @@ start_llama() {
   require_command "$LLAMA_SERVER_BIN"
   require_free_port "llama-server" "$LLAMA_PORT" "$LLAMA_PID"
 
-  local args=(
-    -hf "$VLM_MODEL_ID"
+  local args=()
+  if [[ -n "$LLAMA_MODEL_PATH" ]]; then
+    args+=(-m "$LLAMA_MODEL_PATH")
+  elif [[ -n "$LLAMA_MODEL_URL" ]]; then
+    args+=(--model-url "$LLAMA_MODEL_URL")
+  else
+    args+=(-hf "$VLM_MODEL_ID")
+    if [[ -n "$LLAMA_HF_FILE" ]]; then
+      args+=(-hff "$LLAMA_HF_FILE")
+    fi
+  fi
+  if [[ -n "$LLAMA_MMPROJ_PATH" ]]; then
+    args+=(--mmproj "$LLAMA_MMPROJ_PATH")
+  elif [[ -n "$LLAMA_MMPROJ_URL" ]]; then
+    args+=(--mmproj-url "$LLAMA_MMPROJ_URL")
+  fi
+  args+=(
     --host "$LLAMA_HOST"
     --port "$LLAMA_PORT"
     -c "$LLAMA_CTX_SIZE"
+    --reasoning "$LLAMA_REASONING"
   )
+  if [[ -n "$LLAMA_REASONING_BUDGET" ]]; then
+    args+=(--reasoning-budget "$LLAMA_REASONING_BUDGET")
+  fi
   if [[ -n "${LLAMA_EXTRA_ARGS:-}" ]]; then
     # shellcheck disable=SC2206
     local extra_args=( $LLAMA_EXTRA_ARGS )

@@ -173,10 +173,14 @@ def build_context_text(payload: Dict[str, Any]) -> str:
     context = {
         "schema_version": payload.get("schema_version"),
         "recent_actions": payload.get("recent_actions", []),
+        "recent_decisions": payload.get("recent_decisions", []),
         "current_pose": payload.get("current_pose"),
         "current_position_m": payload.get("current_position_m"),
+        "current_floor_position_m": payload.get("current_floor_position_m"),
         "pose_error": payload.get("pose_error"),
         "default_goal_location": payload.get("default_goal_location"),
+        "activity_hint": payload.get("activity_hint"),
+        "world_memory": payload.get("world_memory"),
     }
     return "Decision context JSON:\n" + json.dumps(context, ensure_ascii=True, sort_keys=True)
 
@@ -388,6 +392,9 @@ def normalize_generate_motion(payload: Dict[str, Any]) -> Dict[str, Any]:
     goal_location = candidate_goal_location(payload)
     if goal_location is not None:
         result["goal_location"] = goal_location
+    angle = candidate_angle(payload)
+    if angle is not None:
+        result[angle[0]] = angle[1]
     reason = str(payload.get("reason", ""))
     if reason:
         result["reason"] = reason
@@ -417,6 +424,24 @@ def candidate_goal_location(payload: Dict[str, Any]) -> Any:
     ):
         if key in payload:
             return payload.get(key)
+    return None
+
+
+def candidate_angle(payload: Dict[str, Any]) -> Optional[tuple[str, Any]]:
+    for key in (
+        "angle_degrees",
+        "turn_degrees",
+        "rotation_degrees",
+        "angle",
+        "degrees",
+        "goal_angle",
+        "angle_radians",
+        "turn_radians",
+        "rotation_radians",
+        "radians",
+    ):
+        if key in payload:
+            return key, payload.get(key)
     return None
 
 
