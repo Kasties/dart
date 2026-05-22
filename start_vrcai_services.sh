@@ -46,6 +46,7 @@ Environment overrides:
   OPENROUTER_TITLE        Optional OpenRouter title header. Default: VRCAI.
   OPENROUTER_PROVIDER     Optional provider slug/order, comma-separated. Example: alibaba.
   OPENROUTER_ALLOW_FALLBACKS  Set to 1 to allow fallback providers when OPENROUTER_PROVIDER is set. Default: 0 when a provider is pinned.
+  OPENROUTER_RESPONSE_FORMAT  Set to 0 for OpenRouter models that do not support response_format JSON mode.
   DEPTH_ENABLE            Start Depth Anything with the full stack when set to 1. Default: 0.
   DEPTH_HOST              Depth adapter bind host. Default: 0.0.0.0.
   DEPTH_PORT              Depth adapter port. Default: 8779.
@@ -137,6 +138,7 @@ OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
 OPENROUTER_TITLE="${OPENROUTER_TITLE:-VRCAI}"
 OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-${OPENROUTER_PROVIDER_ORDER:-}}"
 OPENROUTER_ALLOW_FALLBACKS="${OPENROUTER_ALLOW_FALLBACKS:-}"
+OPENROUTER_RESPONSE_FORMAT="${OPENROUTER_RESPONSE_FORMAT:-}"
 DEPTH_ENABLE="${DEPTH_ENABLE:-0}"
 DEPTH_HOST="${DEPTH_HOST:-0.0.0.0}"
 DEPTH_PORT="${DEPTH_PORT:-8779}"
@@ -395,6 +397,13 @@ start_vlm_adapter() {
       args+=(--openrouter-allow-fallbacks)
     else
       args+=(--openrouter-no-provider-fallbacks)
+    fi
+  fi
+  if [[ -n "$OPENROUTER_RESPONSE_FORMAT" ]]; then
+    if [[ "$OPENROUTER_RESPONSE_FORMAT" == "0" || "$OPENROUTER_RESPONSE_FORMAT" == "false" ]]; then
+      args+=(--openrouter-no-response-format)
+    else
+      args+=(--openrouter-response-format)
     fi
   fi
 

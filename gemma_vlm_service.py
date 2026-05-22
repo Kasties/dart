@@ -105,6 +105,19 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Require the requested OpenRouter provider order without falling back to other providers.",
     )
+    parser.add_argument(
+        "--openrouter-response-format",
+        dest="openrouter_response_format",
+        action="store_true",
+        default=None,
+        help="Request OpenRouter JSON response_format. Enabled by default.",
+    )
+    parser.add_argument(
+        "--openrouter-no-response-format",
+        dest="openrouter_response_format",
+        action="store_false",
+        help="Do not send response_format to OpenRouter. Use this for models that do not support JSON mode.",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +195,7 @@ class OpenRouterVlmBackend:
     title: str = "VRCAI"
     provider_order: tuple[str, ...] = ()
     allow_fallbacks: Optional[bool] = None
+    response_format: bool = True
     http_post: Optional[HttpPoster] = None
 
     def __post_init__(self) -> None:
@@ -197,6 +211,7 @@ class OpenRouterVlmBackend:
             "openrouter_url": self._chat_completions_url(),
             "provider_order": list(self.provider_order),
             "allow_fallbacks": self.allow_fallbacks,
+            "response_format": bool(self.response_format),
             "api_key_configured": bool(self.api_key),
         }
 
@@ -206,6 +221,7 @@ class OpenRouterVlmBackend:
             model_id=self.model_id,
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
+            include_response_format=self.response_format,
         )
         provider_config = build_openrouter_provider_config(
             provider_order=self.provider_order,
@@ -257,8 +273,9 @@ def build_llama_chat_request(
     model_id: str,
     max_new_tokens: int,
     temperature: float,
+    include_response_format: bool = True,
 ) -> Dict[str, Any]:
-    return {
+    request = {
         "model": model_id,
         "messages": [
             {
@@ -269,8 +286,10 @@ def build_llama_chat_request(
         "max_tokens": int(max_new_tokens),
         "temperature": float(temperature),
         "stream": False,
-        "response_format": {"type": "json_object"},
     }
+    if include_response_format:
+        request["response_format"] = {"type": "json_object"}
+    return request
 
 
 def build_openrouter_provider_config(
@@ -659,6 +678,7 @@ def main() -> int:
             or os.environ.get("OPENROUTER_PROVIDER_ORDER", "")
         )
         env_allow_fallbacks = parse_optional_bool(os.environ.get("OPENROUTER_ALLOW_FALLBACKS", ""))
+        env_response_format = parse_optional_bool(os.environ.get("OPENROUTER_RESPONSE_FORMAT", ""))
         allow_fallbacks = (
             args.openrouter_allow_fallbacks
             if args.openrouter_allow_fallbacks is not None
@@ -667,6 +687,13 @@ def main() -> int:
             else False
             if provider_order
             else None
+        )
+        response_format = (
+            args.openrouter_response_format
+            if args.openrouter_response_format is not None
+            else env_response_format
+            if env_response_format is not None
+            else True
         )
         backend = OpenRouterVlmBackend(
             model_id=model_id,
@@ -678,6 +705,7 @@ def main() -> int:
             title=args.openrouter_title or os.environ.get("OPENROUTER_TITLE", "VRCAI"),
             provider_order=provider_order,
             allow_fallbacks=allow_fallbacks,
+            response_format=response_format,
         )
     else:
         model_id = args.model_id or DEFAULT_MODEL_ID
