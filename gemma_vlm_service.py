@@ -23,10 +23,29 @@ DEFAULT_LLAMA_URL = "http://127.0.0.1:8778"
 DEFAULT_MAX_NEW_TOKENS = 160
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT_SEC = 120.0
+DEFAULT_RESPONSE_FORMAT = False
+UPSTREAM_IMAGE_COUNT = 1
+WORLD_MEMORY_CELL_COUNT = 4
+WORLD_MEMORY_WALK_ATTEMPT_COUNT = 2
+WORLD_MEMORY_FRONTIER_GOAL_COUNT = 2
+CONTEXT_KEYS = (
+    "activity_hint",
+    "current_floor_position_m",
+    "default_goal_location",
+    "pose_error",
+    "recent_actions",
+    "world_memory",
+)
 GENERIC_MOTION_PATTERN = re.compile(
     r"\b(walk|run|jog|turn|rotate|pivot|wave|point|look|scan|crouch|duck|squat|"
     r"jump|hop|dance|idle|shift|fidget|stand|stop|stay|step)\b"
 )
+SCENE_REFERENCE_PATTERN = re.compile(
+    r"\b(nearest|nearby|closest|avatar|player|person|character|object|door|doorway|"
+    r"mirror|path|obstacle|wall|chair|thing|target|them|him|her|it)\b|"
+    r"\b(towards?|to|at|near|beside|behind|through|into|onto|from)\b"
+)
+MOTION_TAG_PATTERN = re.compile(r"\{\s*motion\s*:\s*([^{}]*)\}", re.IGNORECASE)
 GO_TO_ACTION_NAMES = {
     "go_to",
     "goto",
@@ -110,13 +129,13 @@ def parse_args() -> argparse.Namespace:
         dest="openrouter_response_format",
         action="store_true",
         default=None,
-        help="Request OpenRouter JSON response_format. Enabled by default.",
+        help="Request OpenRouter JSON response_format. Disabled by default for free-text motion tags.",
     )
     parser.add_argument(
         "--openrouter-no-response-format",
         dest="openrouter_response_format",
         action="store_false",
-        help="Do not send response_format to OpenRouter. Use this for models that do not support JSON mode.",
+        help="Do not send response_format to OpenRouter. This is the default free-text motion-tag mode.",
     )
     return parser.parse_args()
 
@@ -158,12 +177,14 @@ class LlamaCppVlmBackend:
         )
         response = self._post_json("/v1/chat/completions", request_payload)
         raw_text = extract_llama_chat_content(response).strip()
+        action = normalize_model_response(raw_text)
         return {
             "ok": True,
             "service": SERVICE_NAME,
             "model_id": self.model_id,
             "raw_text": raw_text,
-            "action": normalize_action(extract_json_object(raw_text)),
+            "speech_text": str(action.get("speech_text", "")),
+            "action": action,
         }
 
     def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -195,7 +216,7 @@ class OpenRouterVlmBackend:
     title: str = "VRCAI"
     provider_order: tuple[str, ...] = ()
     allow_fallbacks: Optional[bool] = None
-    response_format: bool = True
+    response_format: bool = DEFAULT_RESPONSE_FORMAT
     http_post: Optional[HttpPoster] = None
 
     def __post_init__(self) -> None:
@@ -231,6 +252,7 @@ class OpenRouterVlmBackend:
             request_payload["provider"] = provider_config
         response = self._post_json(request_payload)
         raw_text = extract_llama_chat_content(response).strip()
+        action = normalize_model_response(raw_text)
         return {
             "ok": True,
             "service": SERVICE_NAME,
@@ -238,7 +260,8 @@ class OpenRouterVlmBackend:
             "model_id": self.model_id,
             "provider": provider_config,
             "raw_text": raw_text,
-            "action": normalize_action(extract_json_object(raw_text)),
+            "speech_text": str(action.get("speech_text", "")),
+            "action": action,
         }
 
     def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -273,7 +296,7 @@ def build_llama_chat_request(
     model_id: str,
     max_new_tokens: int,
     temperature: float,
-    include_response_format: bool = True,
+    include_response_format: bool = DEFAULT_RESPONSE_FORMAT,
 ) -> Dict[str, Any]:
     request = {
         "model": model_id,
@@ -313,7 +336,7 @@ def build_llama_message_content(payload: Dict[str, Any]) -> list[Dict[str, Any]]
             "text": controller_prompt + "\n\n" + build_context_text(payload),
         }
     ]
-    for frame in payload.get("frames", []):
+    for frame in latest_frames(payload.get("frames", []), UPSTREAM_IMAGE_COUNT):
         data_url = frame_data_url(frame)
         if data_url:
             content.append(
@@ -325,26 +348,110 @@ def build_llama_message_content(payload: Dict[str, Any]) -> list[Dict[str, Any]]
     content.append(
         {
             "type": "text",
-            "text": "Choose the next action from the newest frame context. Return JSON only.",
+            "text": (
+                "Reply now as normal text. Include at most one {motion: short generic motion prompt} "
+                "tag only when the avatar should move."
+            ),
         }
     )
     return content
 
 
 def build_context_text(payload: Dict[str, Any]) -> str:
-    context = {
-        "schema_version": payload.get("schema_version"),
-        "recent_actions": payload.get("recent_actions", []),
-        "recent_decisions": payload.get("recent_decisions", []),
-        "current_pose": payload.get("current_pose"),
-        "current_position_m": payload.get("current_position_m"),
-        "current_floor_position_m": payload.get("current_floor_position_m"),
-        "pose_error": payload.get("pose_error"),
-        "default_goal_location": payload.get("default_goal_location"),
-        "activity_hint": payload.get("activity_hint"),
-        "world_memory": payload.get("world_memory"),
-    }
+    context: Dict[str, Any] = {}
+    for key in CONTEXT_KEYS:
+        value = payload.get(key)
+        if key == "world_memory":
+            value = compact_world_memory_context(value)
+        if has_context_value(value):
+            context[key] = value
     return "Decision context JSON:\n" + json.dumps(context, ensure_ascii=True, sort_keys=True)
+
+
+def compact_world_memory_context(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    for key in (
+        "current_cell",
+        "current_floor_position_m",
+        "visited_cell_count",
+        "suggested_exploration_goal_location",
+        "exploration_hint",
+    ):
+        if key in value:
+            compact[key] = value.get(key)
+    compact["nearby_or_recent_cells"] = [
+        compact_world_memory_cell(cell)
+        for cell in limited_dicts(value.get("nearby_or_recent_cells"), WORLD_MEMORY_CELL_COUNT)
+    ]
+    compact["candidate_unvisited_goal_locations"] = limited_values(
+        value.get("candidate_unvisited_goal_locations"),
+        WORLD_MEMORY_FRONTIER_GOAL_COUNT,
+    )
+    compact["frontier_goal_locations"] = limited_values(
+        value.get("frontier_goal_locations"),
+        WORLD_MEMORY_FRONTIER_GOAL_COUNT,
+    )
+    compact["recent_walk_attempts"] = [
+        compact_walk_attempt(attempt)
+        for attempt in limited_dicts(
+            value.get("recent_walk_attempts"),
+            WORLD_MEMORY_WALK_ATTEMPT_COUNT,
+            from_end=True,
+        )
+    ]
+    return compact
+
+
+def compact_world_memory_cell(cell: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: cell.get(key)
+        for key in ("cell", "center_floor_position_m", "visits", "is_current")
+        if key in cell
+    }
+
+
+def compact_walk_attempt(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: attempt.get(key)
+        for key in (
+            "prompt",
+            "goal_location",
+            "latest_distance_to_goal_m",
+            "progress_to_goal_m",
+            "status",
+        )
+        if key in attempt
+    }
+
+
+def latest_frames(value: Any, limit: int) -> list[Dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    frames = [frame for frame in value if isinstance(frame, dict)]
+    return frames[-int(limit) :]
+
+
+def has_context_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if value == "" or value == [] or value == {}:
+        return False
+    return True
+
+
+def limited_dicts(value: Any, limit: int, from_end: bool = False) -> list[Dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    items = list(value)[-limit:] if from_end else list(value)[:limit]
+    return [item for item in items if isinstance(item, dict)]
+
+
+def limited_values(value: Any, limit: int) -> list[Any]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    return list(value)[:limit]
 
 
 def frame_data_url(frame: Any) -> str:
@@ -509,24 +616,16 @@ def decode_json_body(body: str, error_context: str = "llama.cpp") -> Dict[str, A
 
 def default_controller_prompt() -> str:
     return (
-        "You control a VRChat avatar by selecting text-to-motion actions from live "
-        "screen images. Be action-forward: if the scene contains a nearby avatar, "
-        "object, path, obstacle, social cue, or the avatar has been idle, choose "
-        "generate_motion with a short physical response. Use noop only when the "
-        "scene is unreadable, a recent action already covers the moment, or no "
-        "safe/relevant movement can be inferred. Return exactly one JSON object "
-        "with this schema: "
-        '{"action":"noop","reason":"..."} or '
-        '{"action":"generate_motion","prompt":"short motion prompt",'
-        '"motion_length":4.0,"reset_session":false} or '
-        '{"action":"reset_session","reason":"..."}. '
-        "DART receives only the prompt text and cannot see the image, so never "
-        "mention visible targets or scene references such as nearest avatar, "
-        "that person, the object, the mirror, the door, or towards it. Translate "
-        "what you see into one generic action primitive, such as walk forward, "
-        "walk backward, turn left, turn right, wave, point forward, look around, "
-        "step back, crouch, jump, dance, idle shift, or stand still. Do not choose "
-        "OSC, avatar parameters, chat, or any non-motion action."
+        "You control a VRChat avatar from live screen images. Reply in short natural "
+        "speech text. Motion is optional and happens only when you include exactly one "
+        "inline tag like {motion: wave hello}. If no movement is useful, omit the tag. "
+        "Text outside the tag is speech text for future TTS. DART receives only the "
+        "motion tag prompt and cannot see the image, so never mention visible targets "
+        "or scene references such as nearest avatar, that person, the object, the "
+        "mirror, the door, or towards it in the tag. Use generic motion primitives "
+        "such as walk forward, walk backward, turn left, turn right, wave, point "
+        "forward, look around, step back, crouch, jump, dance, idle shift, or stand "
+        "still. Do not return JSON unless explicitly instructed by the caller."
     )
 
 
@@ -544,16 +643,61 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def normalize_model_response(raw_text: str) -> Dict[str, Any]:
+    text = str(raw_text or "")
+    tag_payload = extract_motion_tag_payload(text)
+    if tag_payload is not None:
+        return normalize_action(tag_payload)
+    legacy_payload = extract_json_object(text)
+    if isinstance(legacy_payload, dict):
+        return normalize_action(legacy_payload)
+    return {
+        "action": "noop",
+        "reason": "no_motion_tag",
+        "speech_text": strip_motion_tags(text),
+    }
+
+
+def extract_motion_tag_payload(text: str) -> Optional[Dict[str, Any]]:
+    matches = list(MOTION_TAG_PATTERN.finditer(str(text)))
+    if not matches:
+        return None
+    speech_text = strip_motion_tags(text)
+    for match in matches:
+        prompt = str(match.group(1)).strip()
+        if prompt:
+            return {
+                "action": "generate_motion",
+                "prompt": prompt,
+                "speech_text": speech_text,
+                "reason": "motion_tag",
+            }
+    return {
+        "action": "noop",
+        "reason": "empty_motion_tag",
+        "speech_text": speech_text,
+    }
+
+
+def strip_motion_tags(text: str) -> str:
+    stripped = MOTION_TAG_PATTERN.sub(" ", str(text))
+    return " ".join(stripped.split()).strip()
+
+
 def normalize_action(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {"action": "noop", "reason": "invalid_json"}
     action = str(payload.get("action", "")).strip()
     action_key = action.lower()
     if action_key == "noop":
-        return {
+        result = {
             "action": "noop",
             "reason": str(payload.get("reason", "")),
         }
+        speech_text = str(payload.get("speech_text", ""))
+        if speech_text:
+            result["speech_text"] = speech_text
+        return result
     if action_key == "generate_motion":
         return normalize_generate_motion(payload)
     if is_go_to_action(action):
@@ -563,15 +707,19 @@ def normalize_action(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         prompt = str(payload.get("prompt", "")).strip() or action
         return normalize_generate_motion({**payload, "action": "generate_motion", "prompt": prompt})
     if action_key == "reset_session":
-        return {
+        result = {
             "action": "reset_session",
             "reason": str(payload.get("reason", "")),
         }
+        speech_text = str(payload.get("speech_text", ""))
+        if speech_text:
+            result["speech_text"] = speech_text
+        return result
     return {"action": "noop", "reason": "unsupported_action: {action}".format(action=action)}
 
 
 def normalize_generate_motion(payload: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = str(payload.get("prompt", "")).strip()
+    prompt = normalize_motion_prompt_for_dart(str(payload.get("prompt", "")).strip())
     if not prompt:
         return {"action": "noop", "reason": "missing_prompt"}
     result: Dict[str, Any] = {
@@ -579,6 +727,9 @@ def normalize_generate_motion(payload: Dict[str, Any]) -> Dict[str, Any]:
         "prompt": prompt,
         "reset_session": bool(payload.get("reset_session", False)),
     }
+    speech_text = str(payload.get("speech_text", ""))
+    if speech_text:
+        result["speech_text"] = speech_text
     motion_length = coerce_positive_float(payload.get("motion_length"))
     if motion_length is not None:
         result["motion_length"] = motion_length
@@ -592,6 +743,68 @@ def normalize_generate_motion(payload: Dict[str, Any]) -> Dict[str, Any]:
     if reason:
         result["reason"] = reason
     return result
+
+
+def normalize_motion_prompt_for_dart(prompt: str) -> str:
+    normalized = " ".join(str(prompt).strip().lower().replace("_", " ").split())
+    normalized = normalized.strip(" .,!?:;\"'")
+    if not normalized:
+        return ""
+    if looks_like_generic_motion_prompt(normalized):
+        return normalized
+    if re.search(r"\b(turn|rotate|pivot)\s+left\b", normalized):
+        return "turn left"
+    if re.search(r"\b(turn|rotate|pivot)\s+to\s+the\s+left\b", normalized):
+        return "turn left"
+    if re.search(r"\b(turn|rotate|pivot)\s+right\b", normalized):
+        return "turn right"
+    if re.search(r"\b(turn|rotate|pivot)\s+to\s+the\s+right\b", normalized):
+        return "turn right"
+    if re.search(r"\b(back away|step away|move away|walk away|retreat)\b", normalized):
+        return "step back"
+    if re.search(r"\b(step|walk|move)\s+back(ward|wards)?\b", normalized):
+        return "walk backward"
+    if re.search(r"\b(run|jog)\b", normalized):
+        return "jog forward"
+    if re.search(r"\b(walk|move|go|approach|head|proceed|advance|follow)\b", normalized):
+        return "walk forward"
+    if re.search(r"\bwave\b", normalized):
+        return "wave"
+    if re.search(r"\b(point|gesture)\b", normalized):
+        return "point forward"
+    if re.search(r"\b(look|scan|watch|observe|inspect)\b", normalized):
+        return "look around"
+    if re.search(r"\b(crouch|duck|squat)\b", normalized):
+        return "crouch"
+    if re.search(r"\b(jump|hop)\b", normalized):
+        return "jump"
+    if re.search(r"\b(dance|celebrate)\b", normalized):
+        return "dance"
+    if re.search(r"\b(idle|shift|fidget)\b", normalized):
+        return "idle shift"
+    if re.search(r"\b(stand|stop|stay)\b", normalized):
+        return "stand still"
+    scrubbed = re.sub(
+        r"\b(nearest|nearby|closest|that|this|the|a|an)\s+"
+        r"(avatar|player|person|character|object|door|doorway|mirror|path|obstacle|wall|chair|thing)\b",
+        "",
+        normalized,
+    )
+    scrubbed = re.sub(
+        r"\b(towards?|to|at|near|beside|behind|around|through|into|onto|from)\b.*$",
+        "",
+        scrubbed,
+    )
+    scrubbed = " ".join(scrubbed.split()).strip(" .,!?:;\"'")
+    if scrubbed:
+        return " ".join(scrubbed.split()[:6])
+    return "look around"
+
+
+def looks_like_generic_motion_prompt(prompt: str) -> bool:
+    if len(prompt.split()) > 8:
+        return False
+    return bool(GENERIC_MOTION_PATTERN.search(prompt)) and not SCENE_REFERENCE_PATTERN.search(prompt)
 
 
 def is_motion_shorthand_action(action: str) -> bool:
@@ -693,7 +906,7 @@ def main() -> int:
             if args.openrouter_response_format is not None
             else env_response_format
             if env_response_format is not None
-            else True
+            else DEFAULT_RESPONSE_FORMAT
         )
         backend = OpenRouterVlmBackend(
             model_id=model_id,

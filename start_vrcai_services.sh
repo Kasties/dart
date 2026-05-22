@@ -46,7 +46,7 @@ Environment overrides:
   OPENROUTER_TITLE        Optional OpenRouter title header. Default: VRCAI.
   OPENROUTER_PROVIDER     Optional provider slug/order, comma-separated. Example: alibaba.
   OPENROUTER_ALLOW_FALLBACKS  Set to 1 to allow fallback providers when OPENROUTER_PROVIDER is set. Default: 0 when a provider is pinned.
-  OPENROUTER_RESPONSE_FORMAT  Set to 0 for OpenRouter models that do not support response_format JSON mode.
+  OPENROUTER_RESPONSE_FORMAT  Set to 1 to force OpenRouter JSON response_format. Default: 0 for free-text motion tags.
   DEPTH_ENABLE            Start Depth Anything with the full stack when set to 1. Default: 0.
   DEPTH_HOST              Depth adapter bind host. Default: 0.0.0.0.
   DEPTH_PORT              Depth adapter port. Default: 8779.
