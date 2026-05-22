@@ -55,6 +55,32 @@ _DART_TO_HML3D_AXIS = np.array(
 )
 
 
+def trim_goal_sequence_to_closest_pelvis_frame(
+    dart_joints: np.ndarray,
+    goal_location: tuple[float, float, float],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    joints = np.asarray(dart_joints, dtype=np.float32)
+    if joints.ndim != 3 or joints.shape[1:] != (22, 3):
+        raise ValueError(
+            "Expected DART joints shaped (frames, 22, 3), got {shape}.".format(shape=joints.shape)
+        )
+    if joints.shape[0] == 0:
+        raise ValueError("DART joint sequences must contain at least one frame.")
+    goal = np.asarray(goal_location, dtype=np.float32)
+    if goal.shape != (3,):
+        raise ValueError("goal_location must contain exactly three values.")
+
+    distances = np.linalg.norm(joints[:, 0, :2] - goal[:2], axis=1)
+    closest_frame_index = int(np.argmin(distances))
+    trimmed = joints[: closest_frame_index + 1].astype(np.float32, copy=True)
+    return trimmed, {
+        "closest_frame_index": closest_frame_index,
+        "goal_distance": float(distances[closest_frame_index]),
+        "original_frame_count": int(joints.shape[0]),
+        "trimmed_frame_count": int(trimmed.shape[0]),
+    }
+
+
 def reorder_dart_joints_to_vrcai(dart_joints: np.ndarray) -> np.ndarray:
     joints = np.asarray(dart_joints, dtype=np.float32)
     if joints.ndim != 3 or joints.shape[1:] != (22, 3):

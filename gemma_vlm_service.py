@@ -4,15 +4,19 @@ import argparse
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import re
 import traceback
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 import urllib.error
 import urllib.request
 
 
 SERVICE_NAME = "llama_vlm_service_v1"
+SUPPORTED_BACKENDS = ("llama", "openrouter")
 DEFAULT_MODEL_ID = "ggml-org/gemma-4-E4B-it-GGUF"
+DEFAULT_OPENROUTER_MODEL_ID = "google/gemini-2.5-flash"
+DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8777
 DEFAULT_LLAMA_URL = "http://127.0.0.1:8778"
@@ -41,7 +45,13 @@ HttpGetter = Callable[[str, float], Dict[str, Any]]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Persistent llama.cpp-backed VLM decision adapter."
+        description="Persistent VLM decision adapter."
+    )
+    parser.add_argument(
+        "--backend",
+        choices=SUPPORTED_BACKENDS,
+        default="llama",
+        help="VLM backend to use. openrouter calls the OpenRouter API instead of llama-server.",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="Adapter bind host.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Adapter TCP port.")
@@ -52,11 +62,49 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-id",
-        default=DEFAULT_MODEL_ID,
-        help="Model id reported by the adapter and sent to llama-server.",
+        default=None,
+        help="Model id sent to the selected backend. Defaults depend on --backend.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument(
+        "--openrouter-api-key",
+        default="",
+        help="OpenRouter API key. Defaults to OPENROUTER_API_KEY.",
+    )
+    parser.add_argument(
+        "--openrouter-url",
+        default="",
+        help="OpenRouter API base URL or chat completions endpoint.",
+    )
+    parser.add_argument(
+        "--openrouter-referer",
+        default="",
+        help="Optional HTTP-Referer header for OpenRouter rankings.",
+    )
+    parser.add_argument(
+        "--openrouter-title",
+        default="",
+        help="Optional X-OpenRouter-Title header.",
+    )
+    parser.add_argument(
+        "--openrouter-provider",
+        default="",
+        help="Optional comma-separated OpenRouter provider slug order, for example alibaba.",
+    )
+    parser.add_argument(
+        "--openrouter-allow-fallbacks",
+        dest="openrouter_allow_fallbacks",
+        action="store_true",
+        default=None,
+        help="Allow OpenRouter to fall back to other providers after the requested provider order.",
+    )
+    parser.add_argument(
+        "--openrouter-no-provider-fallbacks",
+        dest="openrouter_allow_fallbacks",
+        action="store_false",
+        help="Require the requested OpenRouter provider order without falling back to other providers.",
+    )
     return parser.parse_args()
 
 
@@ -122,6 +170,88 @@ class GemmaVlmBackend(LlamaCppVlmBackend):
     """Backward-compatible class name for older local imports/tests."""
 
 
+@dataclass
+class OpenRouterVlmBackend:
+    model_id: str = DEFAULT_OPENROUTER_MODEL_ID
+    api_key: str = ""
+    openrouter_url: str = DEFAULT_OPENROUTER_URL
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+    timeout_sec: float = DEFAULT_TIMEOUT_SEC
+    referer: str = ""
+    title: str = "VRCAI"
+    provider_order: tuple[str, ...] = ()
+    allow_fallbacks: Optional[bool] = None
+    http_post: Optional[HttpPoster] = None
+
+    def __post_init__(self) -> None:
+        self.openrouter_url = self.openrouter_url.rstrip("/")
+        self.provider_order = tuple(provider for provider in self.provider_order if provider)
+        if not self.api_key and self.http_post is None:
+            raise ValueError("OpenRouter backend requires OPENROUTER_API_KEY or --openrouter-api-key.")
+
+    def health(self) -> Dict[str, Any]:
+        return {
+            "backend": "openrouter",
+            "model_id": self.model_id,
+            "openrouter_url": self._chat_completions_url(),
+            "provider_order": list(self.provider_order),
+            "allow_fallbacks": self.allow_fallbacks,
+            "api_key_configured": bool(self.api_key),
+        }
+
+    def decide(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        request_payload = build_llama_chat_request(
+            payload=payload,
+            model_id=self.model_id,
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+        )
+        provider_config = build_openrouter_provider_config(
+            provider_order=self.provider_order,
+            allow_fallbacks=self.allow_fallbacks,
+        )
+        if provider_config:
+            request_payload["provider"] = provider_config
+        response = self._post_json(request_payload)
+        raw_text = extract_llama_chat_content(response).strip()
+        return {
+            "ok": True,
+            "service": SERVICE_NAME,
+            "backend": "openrouter",
+            "model_id": self.model_id,
+            "provider": provider_config,
+            "raw_text": raw_text,
+            "action": normalize_action(extract_json_object(raw_text)),
+        }
+
+    def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = self._chat_completions_url()
+        if self.http_post is not None:
+            return self.http_post(url, payload, self.timeout_sec)
+        headers = self._headers()
+        return post_json_with_headers(
+            url=url,
+            payload=payload,
+            timeout_sec=self.timeout_sec,
+            headers=headers,
+            error_context="OpenRouter",
+        )
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Authorization": "Bearer {key}".format(key=self.api_key)}
+        if self.referer:
+            headers["HTTP-Referer"] = self.referer
+        if self.title:
+            headers["X-OpenRouter-Title"] = self.title
+        return headers
+
+    def _chat_completions_url(self) -> str:
+        if self.openrouter_url.endswith("/chat/completions"):
+            return self.openrouter_url
+        return self.openrouter_url + "/chat/completions"
+
+
 def build_llama_chat_request(
     payload: Dict[str, Any],
     model_id: str,
@@ -141,6 +271,19 @@ def build_llama_chat_request(
         "stream": False,
         "response_format": {"type": "json_object"},
     }
+
+
+def build_openrouter_provider_config(
+    provider_order: Sequence[str],
+    allow_fallbacks: Optional[bool],
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    order = [str(provider).strip() for provider in provider_order if str(provider).strip()]
+    if order:
+        config["order"] = order
+    if allow_fallbacks is not None:
+        config["allow_fallbacks"] = bool(allow_fallbacks)
+    return config
 
 
 def build_llama_message_content(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -280,18 +423,49 @@ def create_http_server(host: str, port: int, backend: Any) -> ThreadingHTTPServe
 
 
 def post_json(url: str, payload: Dict[str, Any], timeout_sec: float) -> Dict[str, Any]:
+    return post_json_with_headers(
+        url=url,
+        payload=payload,
+        timeout_sec=timeout_sec,
+        headers={},
+        error_context="llama.cpp",
+    )
+
+
+def post_json_with_headers(
+    url: str,
+    payload: Dict[str, Any],
+    timeout_sec: float,
+    headers: Dict[str, str],
+    error_context: str,
+) -> Dict[str, Any]:
+    request_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        **headers,
+    }
     request = urllib.request.Request(
         url,
         data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout_sec) as response:
             body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        message = body.strip() or str(exc)
+        raise RuntimeError(
+            "{context} request failed with status {status}: {message}".format(
+                context=error_context,
+                status=exc.code,
+                message=message,
+            )
+        ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError("llama.cpp request failed: {error}".format(error=exc)) from exc
-    return decode_json_body(body)
+        raise RuntimeError("{context} request failed: {error}".format(context=error_context, error=exc)) from exc
+    return decode_json_body(body, error_context)
 
 
 def get_json(url: str, timeout_sec: float) -> Dict[str, Any]:
@@ -301,16 +475,16 @@ def get_json(url: str, timeout_sec: float) -> Dict[str, Any]:
             body = response.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as exc:
         raise RuntimeError("llama.cpp health request failed: {error}".format(error=exc)) from exc
-    return decode_json_body(body)
+    return decode_json_body(body, "llama.cpp")
 
 
-def decode_json_body(body: str) -> Dict[str, Any]:
+def decode_json_body(body: str, error_context: str = "llama.cpp") -> Dict[str, Any]:
     try:
         decoded = json.loads(body or "{}")
     except json.JSONDecodeError as exc:
-        raise RuntimeError("llama.cpp returned invalid JSON: {body}".format(body=body)) from exc
+        raise RuntimeError("{context} returned invalid JSON: {body}".format(context=error_context, body=body)) from exc
     if not isinstance(decoded, dict):
-        raise RuntimeError("llama.cpp returned a non-object JSON response.")
+        raise RuntimeError("{context} returned a non-object JSON response.".format(context=error_context))
     return decoded
 
 
@@ -455,24 +629,85 @@ def coerce_positive_float(value: Any) -> Optional[float]:
     return parsed if parsed > 0.0 else None
 
 
+def parse_provider_order(value: str) -> tuple[str, ...]:
+    providers = []
+    for part in str(value).replace(";", ",").split(","):
+        provider = part.strip()
+        if provider:
+            providers.append(provider)
+    return tuple(providers)
+
+
+def parse_optional_bool(value: str) -> Optional[bool]:
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("Expected boolean value, got {value!r}.".format(value=value))
+
+
 def main() -> int:
     args = parse_args()
-    backend = LlamaCppVlmBackend(
-        model_id=args.model_id,
-        llama_url=args.llama_url,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-    )
+    if args.backend == "openrouter":
+        model_id = args.model_id or os.environ.get("OPENROUTER_MODEL_ID") or DEFAULT_OPENROUTER_MODEL_ID
+        provider_order = parse_provider_order(
+            args.openrouter_provider
+            or os.environ.get("OPENROUTER_PROVIDER", "")
+            or os.environ.get("OPENROUTER_PROVIDER_ORDER", "")
+        )
+        env_allow_fallbacks = parse_optional_bool(os.environ.get("OPENROUTER_ALLOW_FALLBACKS", ""))
+        allow_fallbacks = (
+            args.openrouter_allow_fallbacks
+            if args.openrouter_allow_fallbacks is not None
+            else env_allow_fallbacks
+            if env_allow_fallbacks is not None
+            else False
+            if provider_order
+            else None
+        )
+        backend = OpenRouterVlmBackend(
+            model_id=model_id,
+            api_key=args.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", ""),
+            openrouter_url=args.openrouter_url or os.environ.get("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_URL),
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            referer=args.openrouter_referer or os.environ.get("OPENROUTER_REFERER", ""),
+            title=args.openrouter_title or os.environ.get("OPENROUTER_TITLE", "VRCAI"),
+            provider_order=provider_order,
+            allow_fallbacks=allow_fallbacks,
+        )
+    else:
+        model_id = args.model_id or DEFAULT_MODEL_ID
+        backend = LlamaCppVlmBackend(
+            model_id=model_id,
+            llama_url=args.llama_url,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+        )
     server = create_http_server(args.host, int(args.port), backend)
-    print(
-        "llama.cpp VLM adapter ready on {host}:{port}; upstream {url}; model {model}".format(
-            host=args.host,
-            port=args.port,
-            url=args.llama_url.rstrip("/"),
-            model=args.model_id,
-        ),
-        flush=True,
-    )
+    if args.backend == "openrouter":
+        print(
+            "OpenRouter VLM adapter ready on {host}:{port}; upstream {url}; model {model}".format(
+                host=args.host,
+                port=args.port,
+                url=backend.health()["openrouter_url"],
+                model=model_id,
+            ),
+            flush=True,
+        )
+    else:
+        print(
+            "llama.cpp VLM adapter ready on {host}:{port}; upstream {url}; model {model}".format(
+                host=args.host,
+                port=args.port,
+                url=args.llama_url.rstrip("/"),
+                model=model_id,
+            ),
+            flush=True,
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

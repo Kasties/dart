@@ -19,7 +19,11 @@ from typing import Any, Dict, Optional, Sequence
 import numpy as np
 import torch
 
-from service_results_adapter import convert_dart_world_joints_to_raw_positions, write_mdm_style_results
+from service_results_adapter import (
+    convert_dart_world_joints_to_raw_positions,
+    trim_goal_sequence_to_closest_pelvis_frame,
+    write_mdm_style_results,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -56,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GOAL_INIT_DATA_PATH,
         help="Initial motion seed for reach-location policy requests.",
     )
-    parser.add_argument("--goal-num-envs", type=int, default=1, help="Parallel reach-location policy rollouts.")
+    parser.add_argument("--goal-num-envs", type=int, default=4, help="Parallel reach-location policy rollouts.")
     parser.add_argument("--goal-num-steps", type=int, default=256, help="Maximum reach-location policy steps.")
     parser.add_argument("--goal-obs-angle-clip", type=float, default=60.0, help="Reach policy goal angle observation clip.")
     parser.add_argument("--goal-obs-dist-clip", type=float, default=5.0, help="Reach policy goal distance observation clip.")
@@ -498,9 +502,6 @@ class DartGoalReachController:
         self.env.state_human = _repeat_state(self.parent.current_history_state(), self.env.batch_size)
         next_obs = self.env.get_observation()
 
-        selected_idx = 0
-        reached_goal = False
-        best_distance = math.inf
         for _ in range(self.max_policy_steps):
             with torch.no_grad():
                 action, _, _, _ = self.agent.get_action_and_value(next_obs)
@@ -510,28 +511,34 @@ class DartGoalReachController:
                 next_goal_texts=goal_texts,
                 reset_text=True,
             )
-            distances = torch.norm((goal_tensor - self.env.get_global_pelvis())[:, :2], dim=-1)
-            min_distance, min_idx = distances.min(dim=0)
-            if float(min_distance.item()) < best_distance:
-                best_distance = float(min_distance.item())
-                selected_idx = int(min_idx.item())
             if success.any():
-                selected_idx = int(torch.nonzero(success, as_tuple=True)[0][0].item())
-                reached_goal = True
-                best_distance = float(distances[selected_idx].item())
                 break
 
+        selection = self._select_goal_sequence(goal)
+        selected_idx = int(selection["selected_idx"])
         sequence = self.env.sequences[selected_idx]
-        world_joints_tensor = sequence["joints"]
-        if world_joints_tensor.shape[0] > self.parent.history_length:
-            world_joints_tensor = world_joints_tensor[self.parent.history_length :]
-        world_joints = world_joints_tensor.detach().cpu().numpy()
-        if world_joints.shape[0] == 0:
-            raise RuntimeError("Reach-location policy produced no motion frames.")
-        if frame_count > 0 and world_joints.shape[0] > int(frame_count):
+        world_joints = selection["world_joints"]
+        trim_metadata = selection["trim_metadata"]
+        reached_goal = bool(trim_metadata["goal_distance"] < float(self.env.args.success_threshold))
+        if (
+            not reached_goal
+            and frame_count > 0
+            and world_joints.shape[0] > int(frame_count)
+        ):
             world_joints = world_joints[: int(frame_count)]
+            truncated_goal_distance = float(
+                np.linalg.norm(world_joints[-1, 0, :2] - np.asarray(goal[:2], dtype=np.float32))
+            )
+            trim_metadata = {
+                **trim_metadata,
+                "goal_distance": truncated_goal_distance,
+                "trimmed_frame_count": int(world_joints.shape[0]),
+                "truncated_without_success": True,
+            }
+            trim_metadata.update(self._goal_path_metrics(world_joints, goal))
 
         raw_positions = convert_dart_world_joints_to_raw_positions(world_joints)
+        np.save(str(Path(output_dir) / "dart_world_joints.npy"), world_joints.astype(np.float32))
         write_mdm_style_results(
             output_dir,
             raw_positions,
@@ -550,8 +557,76 @@ class DartGoalReachController:
             "viewer_sample": str(viewer_sample_path),
             "goal_location": list(goal),
             "goal_reached": bool(reached_goal),
-            "goal_distance": float(best_distance),
+            "goal_distance": float(trim_metadata["goal_distance"]),
+            "goal_trim": trim_metadata,
             "goal_policy_checkpoint": str(self.checkpoint),
+        }
+
+    def _select_goal_sequence(self, goal: tuple[float, float, float]) -> Dict[str, Any]:
+        candidates = []
+        for idx, sequence in enumerate(self.env.sequences):
+            world_joints_tensor = sequence.get("joints")
+            if world_joints_tensor is None:
+                continue
+            if world_joints_tensor.shape[0] > self.parent.history_length:
+                world_joints_tensor = world_joints_tensor[self.parent.history_length :]
+            world_joints = world_joints_tensor.detach().cpu().numpy()
+            if world_joints.shape[0] == 0:
+                continue
+            trimmed_joints, trim_metadata = trim_goal_sequence_to_closest_pelvis_frame(world_joints, goal)
+            metrics = self._goal_path_metrics(trimmed_joints, goal)
+            trim_metadata = {
+                **trim_metadata,
+                **metrics,
+                "selected_env": int(idx),
+            }
+            reached_goal = float(trim_metadata["goal_distance"]) < float(self.env.args.success_threshold)
+            path_excess = max(0.0, float(metrics["path_distance_m"]) - float(metrics["direct_distance_m"]))
+            score = (
+                float(trim_metadata["goal_distance"])
+                + 0.10 * path_excess
+                + 0.25 * float(metrics["max_lateral_error_m"])
+            )
+            trim_metadata["selection_score"] = float(score)
+            candidates.append(
+                {
+                    "rank": (0 if reached_goal else 1, float(score)),
+                    "selected_idx": int(idx),
+                    "world_joints": trimmed_joints,
+                    "trim_metadata": trim_metadata,
+                }
+            )
+        if not candidates:
+            raise RuntimeError("Reach-location policy produced no motion frames.")
+        return min(candidates, key=lambda candidate: candidate["rank"])
+
+    def _goal_path_metrics(
+        self,
+        world_joints: np.ndarray,
+        goal: tuple[float, float, float],
+    ) -> Dict[str, float]:
+        pelvis_path = np.asarray(world_joints, dtype=np.float32)[:, 0, :2]
+        goal_xy = np.asarray(goal[:2], dtype=np.float32)
+        start_xy = pelvis_path[0]
+        direct_delta = goal_xy - start_xy
+        direct_distance = float(np.linalg.norm(direct_delta))
+        if pelvis_path.shape[0] > 1:
+            path_distance = float(np.linalg.norm(np.diff(pelvis_path, axis=0), axis=1).sum())
+        else:
+            path_distance = 0.0
+        if direct_distance <= 1e-6:
+            lateral_error = 0.0
+        else:
+            direct_unit = direct_delta / np.float32(direct_distance)
+            rel = pelvis_path - start_xy[None, :]
+            projection = np.sum(rel * direct_unit[None, :], axis=1)
+            closest = start_xy[None, :] + projection[:, None] * direct_unit[None, :]
+            lateral_error = float(np.linalg.norm(pelvis_path - closest, axis=1).max())
+        return {
+            "direct_distance_m": float(direct_distance),
+            "path_distance_m": float(path_distance),
+            "detour_ratio": float(path_distance / max(direct_distance, 1e-6)),
+            "max_lateral_error_m": float(lateral_error),
         }
 
     def _write_goal_viewer_sample(self, output_dir: Path, sequence: Dict[str, Any], selected_idx: int) -> Path:
@@ -701,6 +776,7 @@ class PromptRequestHandler(socketserver.StreamRequestHandler):
                     "goal_location": result.get("goal_location", list(goal_location)),
                     "goal_reached": bool(result.get("goal_reached", False)),
                     "goal_distance": float(result.get("goal_distance", math.inf)),
+                    "goal_trim": result.get("goal_trim"),
                     "goal_policy_checkpoint": str(result.get("goal_policy_checkpoint", "")),
                 }
             )
