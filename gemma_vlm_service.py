@@ -30,10 +30,12 @@ WORLD_MEMORY_WALK_ATTEMPT_COUNT = 2
 WORLD_MEMORY_FRONTIER_GOAL_COUNT = 2
 CONTEXT_KEYS = (
     "activity_hint",
+    "test_text_input",
     "current_floor_position_m",
     "default_goal_location",
     "pose_error",
     "recent_actions",
+    "recent_outputs",
     "world_memory",
 )
 GENERIC_MOTION_PATTERN = re.compile(
@@ -174,6 +176,7 @@ class LlamaCppVlmBackend:
             model_id=self.model_id,
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
+            disable_image_cache=True,
         )
         response = self._post_json("/v1/chat/completions", request_payload)
         raw_text = extract_llama_chat_content(response).strip()
@@ -244,6 +247,11 @@ class OpenRouterVlmBackend:
             temperature=self.temperature,
             include_response_format=self.response_format,
         )
+        # Clients may override the default OpenRouter model per request.
+        model_hint = str(payload.get("model_hint", "")).strip()
+        if model_hint:
+            request_payload["model"] = model_hint
+        requested_model_id = str(request_payload.get("model", self.model_id))
         provider_config = build_openrouter_provider_config(
             provider_order=self.provider_order,
             allow_fallbacks=self.allow_fallbacks,
@@ -251,13 +259,21 @@ class OpenRouterVlmBackend:
         if provider_config:
             request_payload["provider"] = provider_config
         response = self._post_json(request_payload)
+        resolved_model_id = str(response.get("model", "") or requested_model_id)
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
         raw_text = extract_llama_chat_content(response).strip()
         action = normalize_model_response(raw_text)
         return {
             "ok": True,
             "service": SERVICE_NAME,
             "backend": "openrouter",
-            "model_id": self.model_id,
+            "model_id": resolved_model_id,
+            "requested_model_id": requested_model_id,
+            "openrouter_generation_id": str(response.get("id", "") or ""),
+            "upstream_provider": str(response.get("provider", "") or ""),
+            "usage": usage,
             "provider": provider_config,
             "raw_text": raw_text,
             "speech_text": str(action.get("speech_text", "")),
@@ -297,6 +313,7 @@ def build_llama_chat_request(
     max_new_tokens: int,
     temperature: float,
     include_response_format: bool = DEFAULT_RESPONSE_FORMAT,
+    disable_image_cache: bool = False,
 ) -> Dict[str, Any]:
     request = {
         "model": model_id,
@@ -310,6 +327,13 @@ def build_llama_chat_request(
         "temperature": float(temperature),
         "stream": False,
     }
+    if disable_image_cache and any(
+        frame_data_url(frame)
+        for frame in latest_frames(payload.get("frames", []), UPSTREAM_IMAGE_COUNT)
+    ):
+        # Do not let llama-server reuse a cached multimodal prefix for a new frame.
+        # Some chat templates represent different images with the same token sequence.
+        request["cache_prompt"] = False
     if include_response_format:
         request["response_format"] = {"type": "json_object"}
     return request
@@ -330,12 +354,9 @@ def build_openrouter_provider_config(
 
 def build_llama_message_content(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     controller_prompt = str(payload.get("controller_prompt", "")).strip() or default_controller_prompt()
-    content: list[Dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": controller_prompt + "\n\n" + build_context_text(payload),
-        }
-    ]
+    context_text = build_context_text(payload)
+    leading_text = controller_prompt + "\n\n" + context_text if context_text else controller_prompt
+    content: list[Dict[str, Any]] = []
     for frame in latest_frames(payload.get("frames", []), UPSTREAM_IMAGE_COUNT):
         data_url = frame_data_url(frame)
         if data_url:
@@ -345,13 +366,19 @@ def build_llama_message_content(payload: Dict[str, Any]) -> list[Dict[str, Any]]
                     "image_url": {"url": data_url},
                 }
             )
+    reply_instruction = str(payload.get("reply_instruction", "")).strip()
+    if not reply_instruction:
+        reply_instruction = (
+            "Reply now as normal text. Include at most one {motion: short generic motion prompt} "
+            "tag only when the avatar should move."
+        )
+    # Gemma 4's llama.cpp chat template only attaches image features that occur
+    # before the user text. Text-first requests silently behave as text-only and
+    # make the model guess classifications from the prompt wording.
     content.append(
         {
             "type": "text",
-            "text": (
-                "Reply now as normal text. Include at most one {motion: short generic motion prompt} "
-                "tag only when the avatar should move."
-            ),
+            "text": leading_text + "\n\n" + reply_instruction,
         }
     )
     return content
@@ -365,6 +392,8 @@ def build_context_text(payload: Dict[str, Any]) -> str:
             value = compact_world_memory_context(value)
         if has_context_value(value):
             context[key] = value
+    if not context:
+        return ""
     return "Decision context JSON:\n" + json.dumps(context, ensure_ascii=True, sort_keys=True)
 
 
@@ -616,8 +645,15 @@ def decode_json_body(body: str, error_context: str = "llama.cpp") -> Dict[str, A
 
 def default_controller_prompt() -> str:
     return (
-        "You control a VRChat avatar from live screen images. Reply in short natural "
-        "speech text. Motion is optional and happens only when you include exactly one "
+        "You control a VRChat avatar from live screen images or from test_text_input "
+        "when it is provided. Reply in short natural speech text based only on that "
+        "evidence. Do not invent another avatar, player, conversation partner, greeting, "
+        "or social situation. Do not open with generic greetings or questions such as "
+        "hey, hi, hello, what's up, or what are you up to unless a nearby avatar is "
+        "clearly visible or test_text_input explicitly says someone addressed you. Use "
+        "recent_outputs as memory: do not repeat the same speech, greeting, question, "
+        "or motion tag from the last few outputs. Motion is optional and happens only "
+        "when you include exactly one "
         "inline tag like {motion: wave hello}. If no movement is useful, omit the tag. "
         "Text outside the tag is speech text for future TTS. DART receives only the "
         "motion tag prompt and cannot see the image, so never mention visible targets "

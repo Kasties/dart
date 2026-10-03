@@ -710,6 +710,13 @@ class PromptRequestHandler(socketserver.StreamRequestHandler):
 
     def _process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         task = str(request.get("task", "generate_motion"))
+        if task in {"health", "status"}:
+            return {
+                "ok": True,
+                "task": task,
+                "service": SERVICE_NAME,
+                "max_frame_count": int(self.max_frame_count),
+            }
         if task != "generate_motion":
             return {"ok": False, "error": f"Unsupported task '{task}'."}
 

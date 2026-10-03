@@ -107,7 +107,12 @@ class TransformersDepthBackend:
         depth = _depth_array_from_transformers_result(result)
         return DepthPrediction(
             depth=depth,
-            metadata={"backend": "hf", "model_id": self.model_id, "unit": "relative"},
+            metadata={
+                "backend": "hf",
+                "model_id": self.model_id,
+                "unit": "relative",
+                "representation": "inverse_depth",
+            },
         )
 
     def _load(self) -> Any:
@@ -170,7 +175,12 @@ class DepthAnythingV2Backend:
             depth = model.infer_image(raw_img, int(request_payload.get("input_size", self.input_size)))
         return DepthPrediction(
             depth=np.asarray(depth, dtype=np.float32),
-            metadata={"backend": "da2", "encoder": self.encoder, "unit": "relative"},
+            metadata={
+                "backend": "da2",
+                "encoder": self.encoder,
+                "unit": "relative",
+                "representation": "inverse_depth",
+            },
         )
 
     def _load(self) -> Any:
@@ -219,6 +229,7 @@ class DepthAnything3Backend:
                 "backend": "da3",
                 "model_id": self.model_id,
                 "unit": "meters" if "metric" in self.model_id.lower() else "relative",
+                "representation": "depth",
             },
         )
 

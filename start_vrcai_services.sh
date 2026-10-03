@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./start_vrcai_services.sh [start|stop|restart|start-vlm|stop-vlm|restart-vlm|start-depth|stop-depth|restart-depth|start-gemma|stop-gemma|restart-gemma|status|logs|check-env]
+Usage: ./start_vrcai_services.sh [start|stop|restart|start-dart|stop-dart|restart-dart|start-vlm|stop-vlm|restart-vlm|start-depth|stop-depth|restart-depth|start-gemma|stop-gemma|restart-gemma|status|logs|check-env]
 
 Environment overrides:
   VRCAI_SERVICES_ENV      Optional env file to source. Default: $DART_DIR/vrcai_services.local.env.
@@ -25,15 +25,16 @@ Environment overrides:
   VLM_BACKEND             VLM backend: llama or openrouter. Default: llama.
   VLM_MODEL_ID            VLM model id. Defaults to ggml-org/gemma-4-E4B-it-GGUF for llama, google/gemini-2.5-flash for openrouter.
   LLAMA_MODEL_PATH        Local GGUF model path. Overrides VLM_MODEL_ID.
-  LLAMA_MODEL_URL         Direct GGUF model URL. Overrides VLM_MODEL_ID.
+  LLAMA_MODEL_URL         Direct GGUF model URL. Defaults to Gemma 4 Q4_0 for the default model.
   LLAMA_HF_FILE           Explicit Hugging Face GGUF file for older llama.cpp builds.
   LLAMA_MMPROJ_PATH       Local multimodal projector path.
-  LLAMA_MMPROJ_URL        Direct multimodal projector URL.
+  LLAMA_MMPROJ_URL        Direct multimodal projector URL. Defaults to Gemma 4 BF16.
   LLAMA_HOST              llama-server bind host. Default: 127.0.0.1.
   LLAMA_PORT              llama-server port. Default: 8778.
   LLAMA_CTX_SIZE          llama-server context size. Default: 8192.
   LLAMA_REASONING         llama-server reasoning mode. Default: off.
   LLAMA_REASONING_BUDGET  Optional llama-server reasoning token budget.
+  LLAMA_CACHE_PROMPT      Set to 1 to enable prompt caching. Default: 0 because live images change.
   LLAMA_EXTRA_ARGS        Extra llama-server args, split by shell words.
   VLM_HOST                VLM adapter bind host. Default: 0.0.0.0.
   VLM_PORT                VLM adapter port. Default: 8777.
@@ -122,11 +123,26 @@ LLAMA_MODEL_URL="${LLAMA_MODEL_URL:-}"
 LLAMA_HF_FILE="${LLAMA_HF_FILE:-}"
 LLAMA_MMPROJ_PATH="${LLAMA_MMPROJ_PATH:-}"
 LLAMA_MMPROJ_URL="${LLAMA_MMPROJ_URL:-}"
+if [[
+  "$VLM_BACKEND" == "llama" &&
+  "$VLM_MODEL_ID" == "ggml-org/gemma-4-E4B-it-GGUF" &&
+  -z "$LLAMA_MODEL_PATH" &&
+  -z "$LLAMA_MODEL_URL" &&
+  -z "$LLAMA_HF_FILE"
+]]; then
+  # Pin the mutually compatible official pair. The smaller Q8 projector can
+  # load without errors while failing to ground responses in the image.
+  LLAMA_MODEL_URL="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_0.gguf"
+  if [[ -z "$LLAMA_MMPROJ_PATH" && -z "$LLAMA_MMPROJ_URL" ]]; then
+    LLAMA_MMPROJ_URL="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/mmproj-gemma-4-E4B-it-BF16.gguf"
+  fi
+fi
 LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 LLAMA_PORT="${LLAMA_PORT:-8778}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-8192}"
 LLAMA_REASONING="${LLAMA_REASONING:-off}"
 LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-}"
+LLAMA_CACHE_PROMPT="${LLAMA_CACHE_PROMPT:-0}"
 LLAMA_URL="${LLAMA_URL:-http://127.0.0.1:${LLAMA_PORT}}"
 VLM_HOST="${VLM_HOST:-${GEMMA_HOST:-0.0.0.0}}"
 VLM_PORT="${VLM_PORT:-${GEMMA_PORT:-8777}}"
@@ -350,6 +366,13 @@ start_llama() {
   if [[ -n "$LLAMA_REASONING_BUDGET" ]]; then
     args+=(--reasoning-budget "$LLAMA_REASONING_BUDGET")
   fi
+  if [[ "$LLAMA_CACHE_PROMPT" == "1" || "$LLAMA_CACHE_PROMPT" == "true" ]]; then
+    args+=(--cache-prompt)
+  else
+    # Multimodal requests use the same placeholder tokens for different images.
+    # Reusing their KV prefix can make a new frame inherit a prior frame's image.
+    args+=(--no-cache-prompt)
+  fi
   if [[ -n "${LLAMA_EXTRA_ARGS:-}" ]]; then
     # shellcheck disable=SC2206
     local extra_args=( $LLAMA_EXTRA_ARGS )
@@ -520,6 +543,14 @@ start_vlm_stack() {
   start_vlm_adapter
 }
 
+start_dart_only() {
+  activate_runtime
+  echo "Using Python: $PYTHON_BIN"
+  echo "Using DART dir: $DART_DIR"
+  echo "Using PYTHONNOUSERSITE: $PYTHONNOUSERSITE"
+  start_dart
+}
+
 stop_vlm_stack() {
   stop_one "VLM adapter" "$VLM_PID"
   stop_one "llama-server" "$LLAMA_PID"
@@ -539,6 +570,16 @@ case "$ACTION" in
     stop_vlm_stack
     stop_one "DART session service" "$DART_PID"
     start_all
+    ;;
+  start-dart)
+    start_dart_only
+    ;;
+  stop-dart)
+    stop_one "DART session service" "$DART_PID"
+    ;;
+  restart-dart)
+    stop_one "DART session service" "$DART_PID"
+    start_dart_only
     ;;
   start-vlm|start-gemma)
     start_vlm_stack
