@@ -27,11 +27,13 @@ Environment overrides:
   LLAMA_MODEL_PATH        Local GGUF model path. Overrides VLM_MODEL_ID.
   LLAMA_MODEL_URL         Direct GGUF model URL. Defaults to Gemma 4 Q4_0 for the default model.
   LLAMA_HF_FILE           Explicit Hugging Face GGUF file for older llama.cpp builds.
-  LLAMA_MMPROJ_PATH       Local multimodal projector path.
+  LLAMA_MMPROJ_PATH       Local multimodal projector path. A vision-only copy (vrcai
+                          scripts/make_vision_only_mmproj.py) keeps Gemma 4's unused audio encoder off the GPU.
   LLAMA_MMPROJ_URL        Direct multimodal projector URL. Defaults to Gemma 4 BF16.
   LLAMA_HOST              llama-server bind host. Default: 127.0.0.1.
   LLAMA_PORT              llama-server port. Default: 8778.
   LLAMA_CTX_SIZE          llama-server context size. Default: 8192.
+  LLAMA_UBATCH_SIZE       llama-server physical batch size. Default: 320.
   LLAMA_REASONING         llama-server reasoning mode. Default: off.
   LLAMA_REASONING_BUDGET  Optional llama-server reasoning token budget.
   LLAMA_CACHE_PROMPT      Set to 1 to enable prompt caching. Default: 0 because live images change.
@@ -140,6 +142,10 @@ fi
 LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 LLAMA_PORT="${LLAMA_PORT:-8778}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-8192}"
+# The compute buffer grows with the physical batch: Gemma 4 E4B needs 323 MiB
+# at 320 and 517 MiB at the default 512. A Gemma image (264 tokens) must fit in
+# one batch because its tokens attend to each other.
+LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-320}"
 LLAMA_REASONING="${LLAMA_REASONING:-off}"
 LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-}"
 LLAMA_CACHE_PROMPT="${LLAMA_CACHE_PROMPT:-0}"
@@ -361,6 +367,7 @@ start_llama() {
     --host "$LLAMA_HOST"
     --port "$LLAMA_PORT"
     -c "$LLAMA_CTX_SIZE"
+    -ub "$LLAMA_UBATCH_SIZE"
     --reasoning "$LLAMA_REASONING"
   )
   if [[ -n "$LLAMA_REASONING_BUDGET" ]]; then
