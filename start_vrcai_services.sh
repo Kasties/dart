@@ -41,7 +41,7 @@ Environment overrides:
   LLAMA_EXTRA_ARGS        Extra llama-server args, split by shell words.
   VLM_HOST                VLM adapter bind host. Default: 0.0.0.0.
   VLM_PORT                VLM adapter port. Default: 8777.
-  VLM_MAX_NEW_TOKENS      Adapter max response tokens. Default: 160.
+  VLM_MAX_NEW_TOKENS      Adapter max response tokens. Default: 384, room for a full perception reply.
   VLM_TEMPERATURE         Adapter sampling temperature. Default: 0.2.
   OPENROUTER_API_KEY      Required when VLM_BACKEND=openrouter.
   OPENROUTER_MODEL_ID     OpenRouter model id fallback. Default: google/gemini-2.5-flash.
@@ -157,7 +157,10 @@ LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-0}"
 LLAMA_URL="${LLAMA_URL:-http://127.0.0.1:${LLAMA_PORT}}"
 VLM_HOST="${VLM_HOST:-${GEMMA_HOST:-0.0.0.0}}"
 VLM_PORT="${VLM_PORT:-${GEMMA_PORT:-8777}}"
-VLM_MAX_NEW_TOKENS="${VLM_MAX_NEW_TOKENS:-160}"
+# A complete presence-perception reply is 29 labeled lines: 216 Gemma tokens
+# for an empty scene, 306 with every social field filled. At 160 every reply
+# stopped before its speech and next_action lines.
+VLM_MAX_NEW_TOKENS="${VLM_MAX_NEW_TOKENS:-384}"
 VLM_TEMPERATURE="${VLM_TEMPERATURE:-0.2}"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
 OPENROUTER_BASE_URL="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"

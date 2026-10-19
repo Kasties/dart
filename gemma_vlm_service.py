@@ -20,7 +20,8 @@ DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8777
 DEFAULT_LLAMA_URL = "http://127.0.0.1:8778"
-DEFAULT_MAX_NEW_TOKENS = 160
+# A complete presence-perception reply takes up to about 306 Gemma tokens.
+DEFAULT_MAX_NEW_TOKENS = 384
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT_SEC = 120.0
 DEFAULT_RESPONSE_FORMAT = False
