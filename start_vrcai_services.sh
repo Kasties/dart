@@ -37,6 +37,7 @@ Environment overrides:
   LLAMA_REASONING         llama-server reasoning mode. Default: off.
   LLAMA_REASONING_BUDGET  Optional llama-server reasoning token budget.
   LLAMA_CACHE_PROMPT      Set to 1 to enable prompt caching. Default: 0 because live images change.
+  LLAMA_CACHE_RAM         llama-server host-RAM prompt cache in MiB. Default: 0 because nothing reuses prompts.
   LLAMA_EXTRA_ARGS        Extra llama-server args, split by shell words.
   VLM_HOST                VLM adapter bind host. Default: 0.0.0.0.
   VLM_PORT                VLM adapter port. Default: 8777.
@@ -149,6 +150,10 @@ LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-320}"
 LLAMA_REASONING="${LLAMA_REASONING:-off}"
 LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-}"
 LLAMA_CACHE_PROMPT="${LLAMA_CACHE_PROMPT:-0}"
+# By default llama-server keeps finished prompts in host RAM up to 8 GiB,
+# about 105 MiB per Gemma image request. With prompt caching off, nothing
+# reads them back.
+LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-0}"
 LLAMA_URL="${LLAMA_URL:-http://127.0.0.1:${LLAMA_PORT}}"
 VLM_HOST="${VLM_HOST:-${GEMMA_HOST:-0.0.0.0}}"
 VLM_PORT="${VLM_PORT:-${GEMMA_PORT:-8777}}"
@@ -368,6 +373,7 @@ start_llama() {
     --port "$LLAMA_PORT"
     -c "$LLAMA_CTX_SIZE"
     -ub "$LLAMA_UBATCH_SIZE"
+    --cache-ram "$LLAMA_CACHE_RAM"
     --reasoning "$LLAMA_REASONING"
   )
   if [[ -n "$LLAMA_REASONING_BUDGET" ]]; then
