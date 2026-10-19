@@ -143,8 +143,8 @@ LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 LLAMA_PORT="${LLAMA_PORT:-8778}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-8192}"
 # The compute buffer grows with the physical batch: Gemma 4 E4B needs 323 MiB
-# at 320 and 517 MiB at the default 512. A Gemma image (264 tokens) must fit in
-# one batch because its tokens attend to each other.
+# at 320 and 517 MiB at the default 512. llama.cpp decodes E4B image tokens
+# causally, so an image may span batches.
 LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-320}"
 LLAMA_REASONING="${LLAMA_REASONING:-off}"
 LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-}"
