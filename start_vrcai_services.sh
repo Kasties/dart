@@ -99,8 +99,8 @@ GOAL_NUM_STEPS="${GOAL_NUM_STEPS:-256}"
 if [[ -z "${LLAMA_SERVER_BIN:-}" ]]; then
   if command -v llama-server >/dev/null 2>&1; then
     LLAMA_SERVER_BIN="$(command -v llama-server)"
-  elif [[ -x /mnt/ssd/llama.cpp/build/bin/llama-server ]]; then
-    LLAMA_SERVER_BIN="/mnt/ssd/llama.cpp/build/bin/llama-server"
+  elif [[ -x /mnt/ssd/vrcai-stack/llama.cpp/build/bin/llama-server ]]; then
+    LLAMA_SERVER_BIN="/mnt/ssd/vrcai-stack/llama.cpp/build/bin/llama-server"
   else
     LLAMA_SERVER_BIN="llama-server"
   fi
